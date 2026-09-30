@@ -2,6 +2,8 @@
 
 Plan limits for Cursor, Grok Bot, SuperGrok, and Claude in one Omarchy bar panel: how much of each allowance you have used, when it resets, and which plan you are on.
 
+![AI Usage panel with sample numbers](preview.png)
+
 Plugin id: `io.github.hurlydesousa.ai-usage`
 
 ## Install
