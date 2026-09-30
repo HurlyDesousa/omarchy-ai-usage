@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.hurlydesousa.ai-usage",
+  "name": "AI Usage",
+  "version": "0.6.0",
+  "author": "Hurly",
+  "license": "MIT",
+  "description": "Plan limits for Cursor, Grok Bot, SuperGrok, and Claude in one bar panel: how much of each allowance you have used, when it resets, and which plan you are on, read from the sign-ins already on this machine.",
+  "homepage": "https://github.com/HurlyDesousa/omarchy-ai-usage",
+  "repository": "https://github.com/HurlyDesousa/omarchy-ai-usage",
+  "keywords": [
+    "ai",
+    "usage",
+    "quota",
+    "claude",
+    "cursor",
+    "grok"
+  ],
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "AI Usage",
+    "description": "Quota bars for Cursor, Grok Bot, SuperGrok, and Claude",
+    "category": "AI",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
