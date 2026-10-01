@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.hurlydesousa.ai-usage",
   "name": "AI Usage",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "author": "Hurly",
   "license": "MIT",
   "description": "Plan limits for Cursor, Grok Bot, SuperGrok, and Claude in one bar panel: how much of each allowance you have used, when it resets, and which plan you are on, read from the sign-ins already on this machine.",

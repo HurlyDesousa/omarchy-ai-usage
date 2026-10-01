@@ -21,7 +21,7 @@ Panel {
     property bool updating: false
     property bool showSettings: false
     property bool backgroundUpdateTried: false
-    readonly property string appVersion: "0.6.0"
+    readonly property string appVersion: "0.6.1"
 
     readonly property string pluginDir: {
         var s = String(Qt.resolvedUrl("."))
