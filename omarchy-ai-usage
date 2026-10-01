@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """AI Usage backend for the Omarchy bar panel.
 
 `read` prints the panel JSON from the usage state files; `update` refreshes
@@ -10,14 +10,16 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import fcntl
 import json
 import os
 import re
-import shutil
+import signal
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -26,7 +28,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-APP_VERSION = "0.6.1"
+APP_VERSION = "0.6.2"
 
 
 # ── AI agent usage (Cursor / Grok Bot / SuperGrok / Claude) ─────────────────
@@ -51,12 +53,10 @@ CURSOR_PLAN_INFO_URL = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetP
 CURSOR_SAND_USAGE_URL = (
     "https://api2.cursor.sh/aiserver.v1.DashboardService/GetSandUsageStatus"
 )
-CURSOR_OAUTH_TOKEN_URL = "https://api2.cursor.sh/oauth/token"
-CURSOR_OAUTH_CLIENT_ID = "KbZUR41cY7W6zRSdpSUJ7I7mLYBKOCmB"
 CURSOR_ACCESS_TOKEN_KEY = "cursorAuth/accessToken"
-CURSOR_REFRESH_TOKEN_KEY = "cursorAuth/refreshToken"
 CURSOR_DASHBOARD_USER_AGENT = f"omarchy-ai-usage/{APP_VERSION}"
 CURSOR_TIER_LABELS = {
+    "pro+": "Pro+",
     "pro_plus": "Pro+",
     "pro-plus": "Pro+",
     "proplus": "Pro+",
@@ -99,10 +99,85 @@ class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
 
 
 _USAGE_OPENER = urllib.request.build_opener(_RefuseRedirects)
+# Real responses are a few KB; a hostile endpoint must not fill memory.
+USAGE_MAX_RESPONSE_BYTES = 1 << 20
+# Whole-update budget; per-socket timeouts do not bound a chain of requests.
+USAGE_UPDATE_DEADLINE_SECONDS = 90
+
+
+class _CappedResponse:
+    def __init__(self, response):
+        self._response = response
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self._response.close()
+
+    def __getattr__(self, name):
+        return getattr(self._response, name)
+
+    def read(self, *_args) -> bytes:
+        length = str(self._response.headers.get("Content-Length") or "").strip()
+        if length.isdigit() and int(length) > USAGE_MAX_RESPONSE_BYTES:
+            raise ValueError("response too large")
+        data = self._response.read(USAGE_MAX_RESPONSE_BYTES + 1)
+        if len(data) > USAGE_MAX_RESPONSE_BYTES:
+            raise ValueError("response too large")
+        return data
 
 
 def _usage_urlopen(request: urllib.request.Request, timeout: float):
-    return _USAGE_OPENER.open(request, timeout=timeout)
+    return _CappedResponse(_USAGE_OPENER.open(request, timeout=timeout))
+
+
+class _UsageDeadline(Exception):
+    pass
+
+
+@contextlib.contextmanager
+def _usage_hold_signals():
+    """A token refresh rotates the refresh token on the server: dying between
+    the POST and saving the new pair would sign that app out. Termination and
+    the update deadline wait until the block ends."""
+    held = {signal.SIGTERM, signal.SIGINT, signal.SIGHUP, signal.SIGALRM}
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, held)
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+@contextlib.contextmanager
+def _usage_renewal_lock(name: str, wait_seconds: float = 10.0):
+    """Yield True while holding this sign-in's renewal lock, False if busy."""
+    lock_dir = STATE_HOME / "omarchy" / "ai-usage" / "locks"
+    fd = -1
+    try:
+        lock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(
+            lock_dir / f"{name}.lock",
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600,
+        )
+    except OSError:
+        yield False
+        return
+    try:
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    yield False
+                    return
+                time.sleep(0.2)
+        yield True
+    finally:
+        os.close(fd)
 
 
 def _usage_now_iso() -> str:
@@ -116,7 +191,7 @@ def _usage_today() -> str:
 def _usage_number(value) -> int:
     try:
         return int(value or 0)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
 
 
@@ -203,73 +278,38 @@ def _usage_write_record(agent_id: str, record: dict) -> None:
         pass
 
 
-def _usage_collector_paths(agent_id: str) -> list[Path]:
-    names = [f"omarchy-agent-usage-{agent_id}"]
-    roots = []
-    omarchy_path = os.environ.get("OMARCHY_PATH")
-    if omarchy_path:
-        roots.append(Path(omarchy_path) / "bin")
-    roots.extend(
-        [
-            Path("/usr/share/omarchy/bin"),
-            Path.home() / ".local/share/omarchy-rs/bin",
-            Path.home() / ".local/bin",
-        ]
-    )
-    paths: list[Path] = []
-    for name in names:
-        found = shutil.which(name)
-        if found:
-            paths.append(Path(found))
-        for root in roots:
-            candidate = root / name
-            if candidate.is_file():
-                paths.append(candidate)
-    # Preserve order, drop duplicates.
-    seen: set[str] = set()
-    unique: list[Path] = []
-    for path in paths:
-        key = str(path)
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(path)
-    return unique
+def _usage_claude_collector() -> Path:
+    # Omarchy's own collector, by absolute path: a PATH search would let any
+    # file in ~/.local/bin stand in for it.
+    return Path(os.environ.get("OMARCHY_PATH") or "/usr/share/omarchy") / "bin" / "omarchy-agent-usage-claude"
 
 
-def _usage_run_collector(agent_id: str, *args: str) -> tuple[bool, str]:
-    errors: list[str] = []
-    for collector in _usage_collector_paths(agent_id):
-        try:
-            proc = subprocess.run(
-                [str(collector), *args],
-                capture_output=True,
-                text=True,
-                timeout=120,
-                check=False,
-            )
-        except Exception as exc:
-            errors.append(f"{collector.name}: {exc}")
-            continue
-        record = (proc.stdout or "").strip()
-        if proc.returncode != 0 or not record:
-            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
-            snippet = detail[-1] if detail else f"exit {proc.returncode}"
-            errors.append(f"{collector.name}: {snippet}")
-            continue
-        try:
-            parsed = json.loads(record)
-        except json.JSONDecodeError as exc:
-            errors.append(f"{collector.name}: invalid JSON ({exc})")
-            continue
-        if not isinstance(parsed, dict):
-            errors.append(f"{collector.name}: unexpected record type")
-            continue
-        _usage_write_record(agent_id, _usage_normalize_record(agent_id, parsed))
-        return True, ""
-    if not _usage_collector_paths(agent_id):
-        return False, f"omarchy-agent-usage-{agent_id} not found on PATH"
-    return False, errors[-1] if errors else f"omarchy-agent-usage-{agent_id} failed"
+def _usage_run_claude_collector(*args: str) -> tuple[bool, str]:
+    collector = _usage_claude_collector()
+    if not collector.is_file():
+        return False, f"{collector} not found"
+    try:
+        proc = subprocess.run(
+            [str(collector), *args],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except Exception as exc:
+        return False, f"{collector.name}: {exc}"
+    record = (proc.stdout or "").strip()
+    if proc.returncode != 0 or not record:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        return False, f"{collector.name}: {detail[-1] if detail else f'exit {proc.returncode}'}"
+    try:
+        parsed = json.loads(record)
+    except json.JSONDecodeError as exc:
+        return False, f"{collector.name}: invalid JSON ({exc})"
+    if not isinstance(parsed, dict):
+        return False, f"{collector.name}: unexpected record type"
+    _usage_write_record("claude", _usage_normalize_record("claude", parsed))
+    return True, ""
 
 
 def _usage_parse_updated_at(value: Any) -> float | None:
@@ -283,7 +323,7 @@ def _usage_parse_updated_at(value: Any) -> float | None:
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.timestamp()
-    except ValueError:
+    except (ValueError, OverflowError, OSError):
         return None
 
 
@@ -340,43 +380,20 @@ def _usage_read_cursor_access_token() -> str:
     return _usage_read_cursor_item(CURSOR_ACCESS_TOKEN_KEY)
 
 
-def _usage_cursor_refresh_access_token(refresh_token: str) -> str:
-    if not refresh_token:
-        return ""
-    body = json.dumps(
-        {
-            "grant_type": "refresh_token",
-            "client_id": CURSOR_OAUTH_CLIENT_ID,
-            "refresh_token": refresh_token,
-        }
-    ).encode("utf-8")
-    request = urllib.request.Request(
-        CURSOR_OAUTH_TOKEN_URL,
-        data=body,
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": CURSOR_DASHBOARD_USER_AGENT,
-        },
-    )
-    try:
-        with _usage_urlopen(request, timeout=15) as response:
-            payload = json.loads(response.read().decode("utf-8", errors="replace") or "{}")
-    except Exception:
-        return ""
-    if not isinstance(payload, dict) or payload.get("shouldLogout") is True:
-        return ""
-    return str(payload.get("access_token") or "").strip()
+_CURSOR_BEARER: str | None = None
 
 
 def _usage_cursor_bearer() -> str:
-    token = _usage_read_cursor_access_token()
-    if token and not _usage_jwt_is_expired(token):
-        return token
-    refreshed = _usage_cursor_refresh_access_token(
-        _usage_read_cursor_item(CURSOR_REFRESH_TOKEN_KEY)
-    )
-    return refreshed or token
+    """Cursor's own access token while it is valid, else "".
+
+    Never minted from Cursor's refresh token: if the server rotates refresh
+    tokens, the copy Cursor holds would stop working and sign Cursor out.
+    Cursor renews its token itself whenever it runs."""
+    global _CURSOR_BEARER
+    if _CURSOR_BEARER is None:
+        token = _usage_read_cursor_access_token()
+        _CURSOR_BEARER = token if token and not _usage_jwt_is_expired(token) else ""
+    return _CURSOR_BEARER
 
 
 def _usage_cursor_http_json(url: str, token: str) -> dict | None:
@@ -412,6 +429,9 @@ def _usage_cursor_any_to_iso(value: Any) -> str:
         if seconds is None:
             return ""
         value = seconds
+    # Cursor sends epoch milliseconds as a string.
+    if isinstance(value, str) and value.strip().isdigit():
+        value = int(value.strip())
     if isinstance(value, (int, float)):
         ts = float(value)
         if ts > 1_000_000_000_000:
@@ -554,23 +574,7 @@ def _usage_fetch_cursor_dashboard(token: str) -> dict | None:
         auto_frac = plan_auto
     if api_frac is None:
         api_frac = plan_api
-    reset_raw = body.get("billingCycleEnd", body.get("billing_cycle_end"))
-    reset_iso = ""
-    if reset_raw is not None and str(reset_raw).strip():
-        try:
-            if isinstance(reset_raw, (int, float)):
-                ts = float(reset_raw)
-                if ts > 1_000_000_000_000:
-                    ts /= 1000.0
-                reset_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
-            else:
-                text = str(reset_raw).strip()
-                if text.endswith("Z"):
-                    reset_iso = text
-                elif text:
-                    reset_iso = text + "Z" if "T" in text else text + "T00:00:00Z"
-        except (TypeError, ValueError, OSError):
-            reset_iso = ""
+    reset_iso = _usage_cursor_any_to_iso(body.get("billingCycleEnd", body.get("billing_cycle_end")))
 
     limits: list[dict] = []
     if auto_frac is not None:
@@ -639,26 +643,11 @@ def _usage_fetch_cursor_live() -> dict | None:
     token = _usage_cursor_bearer()
     if not token:
         return None
-    record = _usage_fetch_cursor_dashboard(token)
-    if record is not None:
-        return record
-    refreshed = _usage_cursor_refresh_access_token(
-        _usage_read_cursor_item(CURSOR_REFRESH_TOKEN_KEY)
-    )
-    if not refreshed or refreshed == token:
-        return None
-    return _usage_fetch_cursor_dashboard(refreshed)
+    return _usage_fetch_cursor_dashboard(token)
 
 
 def _usage_cursor_sand_usage() -> dict | None:
-    token = _usage_cursor_bearer()
-    payload = _usage_cursor_http_json(CURSOR_SAND_USAGE_URL, token)
-    if payload is None:
-        refreshed = _usage_cursor_refresh_access_token(
-            _usage_read_cursor_item(CURSOR_REFRESH_TOKEN_KEY)
-        )
-        if refreshed:
-            payload = _usage_cursor_http_json(CURSOR_SAND_USAGE_URL, refreshed)
+    payload = _usage_cursor_http_json(CURSOR_SAND_USAGE_URL, _usage_cursor_bearer())
     if not isinstance(payload, dict):
         return None
     body = payload.get("result") if isinstance(payload.get("result"), dict) else payload
@@ -948,16 +937,28 @@ def _usage_grok_write_auth(data: dict) -> None:
 
 
 def _usage_write_private_json(path: Path, data: dict, indent: int | None = None) -> None:
-    """Atomically replace a credential file, keeping it owner-only (0600)."""
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    """Atomically replace a credential file, keeping it owner-only (0600).
+
+    The temp file is new (mkstemp: O_EXCL, 0600) and synced before the rename,
+    so a crash or power cut leaves the old file or the new one, never a
+    truncated or world-readable one."""
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
     try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(json.dumps(data, indent=indent) + ("\n" if indent else ""))
-        tmp.replace(path)
-    except OSError:
-        tmp.unlink(missing_ok=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
         raise
+    with contextlib.suppress(OSError):
+        dir_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
 
 
 def _usage_load_consent() -> dict:
@@ -974,73 +975,92 @@ def _usage_consented(provider: str) -> bool:
 
 
 def _usage_grok_refresh_auth() -> bool:
-    """Silently refresh grok login via OIDC. Never logs tokens."""
+    """Silently refresh grok login via OIDC. Never logs tokens.
+
+    Only xAI-issued entries are touched, and the file is re-read under a lock
+    after the network call: a grok login that happened meanwhile is kept.
+    """
     if not _usage_consented("grok"):
         return False
-    data = _usage_grok_auth_data()
-    if not data:
-        return False
-    changed = False
-    for issuer, entry in data.items():
-        if not isinstance(entry, dict):
+    needs_refresh = False
+    for issuer, entry in _usage_grok_auth_data().items():
+        if not isinstance(entry, dict) or not str(issuer).startswith("https://auth.x.ai"):
             continue
         token = str(entry.get("key") or "").strip()
-        if token and not _usage_jwt_is_expired(token):
-            continue
-        refresh = str(entry.get("refresh_token") or "").strip()
-        if not refresh:
-            continue
-        client_id = str(
-            entry.get("oidc_client_id") or entry.get("client_id") or ""
-        ).strip()
-        issuer_s = str(issuer)
-        if not client_id and "::" in issuer_s:
-            client_id = issuer_s.split("::", 1)[1].strip()
-        if not client_id:
-            continue
-        body = urllib.parse.urlencode(
-            {
-                "grant_type": "refresh_token",
-                "refresh_token": refresh,
-                "client_id": client_id,
-            }
-        ).encode("utf-8")
-        req = urllib.request.Request(
-            GROK_TOKEN_ENDPOINT,
-            data=body,
-            method="POST",
-            headers={
-                "Content-Type": "application/x-www-form-urlencoded",
-                "Accept": "application/json",
-            },
-        )
+        if not token or _usage_jwt_is_expired(token):
+            needs_refresh = True
+            break
+    if not needs_refresh:
+        return False
+
+    with _usage_renewal_lock("grok") as held:
+        if not held:
+            return False
+        data = _usage_grok_auth_data()
+        if not data:
+            return False
+        refreshed: dict[str, dict] = {}
+        for issuer, entry in data.items():
+            if not isinstance(entry, dict) or not str(issuer).startswith("https://auth.x.ai"):
+                continue
+            token = str(entry.get("key") or "").strip()
+            if token and not _usage_jwt_is_expired(token):
+                continue
+            refresh = str(entry.get("refresh_token") or "").strip()
+            client_id = str(entry.get("oidc_client_id") or entry.get("client_id") or "").strip()
+            if not client_id and "::" in str(issuer):
+                client_id = str(issuer).split("::", 1)[1].strip()
+            if not refresh or not client_id:
+                continue
+            body = urllib.parse.urlencode(
+                {"grant_type": "refresh_token", "refresh_token": refresh, "client_id": client_id}
+            ).encode("utf-8")
+            req = urllib.request.Request(
+                GROK_TOKEN_ENDPOINT,
+                data=body,
+                method="POST",
+                headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+            )
+            with _usage_hold_signals():
+                try:
+                    with _usage_urlopen(req, timeout=20) as resp:
+                        payload = json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
+                except Exception:
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+                new_token = str(payload.get("access_token") or "").strip()
+                if not new_token:
+                    continue
+                refreshed[str(issuer)] = payload
+
+        if not refreshed:
+            return False
+        # A grok login during the request holds the newer pair; keep it.
+        current = _usage_grok_auth_data()
+        changed = False
+        for issuer, payload in refreshed.items():
+            entry = current.get(issuer)
+            if not isinstance(entry, dict) or entry.get("refresh_token") != data[issuer].get("refresh_token"):
+                continue
+            entry["key"] = str(payload.get("access_token") or "")
+            new_refresh = str(payload.get("refresh_token") or "").strip()
+            if new_refresh:
+                entry["refresh_token"] = new_refresh
+            try:
+                expires_in = float(payload.get("expires_in") or 0)
+            except (TypeError, ValueError):
+                expires_in = 0.0
+            if expires_in > 0:
+                entry["expires_at"] = int(time.time()) + int(expires_in)
+            changed = True
+        if not changed:
+            return False
         try:
-            with _usage_urlopen(req, timeout=20) as resp:
-                payload = json.loads(resp.read().decode("utf-8", errors="replace") or "{}")
-        except Exception:
-            continue
-        if not isinstance(payload, dict):
-            continue
-        new_token = str(payload.get("access_token") or payload.get("id_token") or "").strip()
-        if not new_token:
-            continue
-        entry["key"] = new_token
-        new_refresh = str(payload.get("refresh_token") or "").strip()
-        if new_refresh:
-            entry["refresh_token"] = new_refresh
-        try:
-            expires_in = float(payload.get("expires_in") or 0)
-        except (TypeError, ValueError):
-            expires_in = 0.0
-        if expires_in > 0:
-            entry["expires_at"] = time.time() + expires_in
-        changed = True
-    if changed:
-        try:
-            _usage_grok_write_auth(data)
+            _usage_grok_write_auth(current)
         except OSError:
             return False
-    return changed
+        return True
 
 
 def _usage_grok_client_version() -> str:
@@ -1552,7 +1572,7 @@ def _usage_parse_reset_datetime(value: Any) -> time.struct_time | None:
         if dt.tzinfo is not None:
             dt = dt.astimezone()
         return dt.timetuple()
-    except ValueError:
+    except (ValueError, OverflowError, OSError):
         pass
     if len(raw) >= 10 and raw[4] == "-" and raw[7] == "-":
         try:
@@ -1571,7 +1591,10 @@ def _usage_reset_caption(resets_at: Any) -> str:
         (reset.tm_year, reset.tm_mon, reset.tm_mday, 0, 0, 0, 0, 0, -1)
     )
     today = time.mktime((now.tm_year, now.tm_mon, now.tm_mday, 0, 0, 0, 0, 0, -1))
-    days_left = max(0, int(round((reset_day - today) / 86400)))
+    days_left = int(round((reset_day - today) / 86400))
+    # A window that already reset says nothing about the current one.
+    if days_left < 0 or (":" in str(resets_at) and time.mktime(reset) <= time.time()):
+        return ""
     month_names = (
         "Jan", "Feb", "Mar", "Apr", "May", "Jun",
         "Jul", "Aug", "Sept", "Oct", "Nov", "Dec",
@@ -1734,13 +1757,9 @@ def _usage_claude_refresh_login() -> bool:
     if not _usage_consented("claude"):
         return False
     path = _usage_claude_credentials_path()
-    lock_path = Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp") / "omarchy-ai-usage-claude-login.lock"
-    try:
-        lock = open(lock_path, "w", encoding="utf-8")
-    except OSError:
-        return False
-    with lock:
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    with _usage_renewal_lock("claude") as held:
+        if not held:
+            return False
         try:
             login = json.loads(path.read_text(encoding="utf-8")).get("claudeAiOauth")
         except Exception:
@@ -1765,11 +1784,12 @@ def _usage_claude_refresh_login() -> bool:
                 "User-Agent": CLAUDE_USER_AGENT,
             },
         )
-        try:
-            with _usage_urlopen(request, timeout=30) as response:
-                payload = json.loads(response.read().decode("utf-8", errors="replace") or "{}")
-        except Exception:
-            return False
+        with _usage_hold_signals():
+            try:
+                with _usage_urlopen(request, timeout=30) as response:
+                    payload = json.loads(response.read().decode("utf-8", errors="replace") or "{}")
+            except Exception:
+                return False
         if not isinstance(payload, dict):
             return False
         access = str(payload.get("access_token") or "").strip()
@@ -1819,11 +1839,13 @@ def _usage_claude_reset_caption(resets_at: Any) -> str:
     if reset_ts is None:
         return ""
     seconds_left = reset_ts - time.time()
+    if seconds_left <= 0:
+        return ""
     if seconds_left >= 86400:
         return _usage_reset_caption(resets_at)
     reset_local = time.localtime(reset_ts)
     clock = time.strftime("%H:%M", reset_local)
-    if reset_local.tm_yday != time.localtime().tm_yday:
+    if reset_local[:3] != time.localtime()[:3]:
         clock = "tomorrow " + clock
     minutes = int(seconds_left // 60)
     if minutes < 1:
@@ -1940,11 +1962,24 @@ def _usage_sign_in_lapsed(agent_id: str, usage_status: str) -> bool:
     return False
 
 
-def _usage_notice(agent_id: str, usage_status: str, panel_limits: list[dict]) -> str:
+def _usage_ago(timestamp: float) -> str:
+    minutes = max(0, int((time.time() - timestamp) // 60))
+    if minutes < 60:
+        return f"{minutes} min ago"
+    if minutes < 48 * 60:
+        return f"{minutes // 60} h ago"
+    return f"{minutes // 1440} days ago"
+
+
+def _usage_notice(agent_id: str, usage_status: str, panel_limits: list[dict], record: dict) -> str:
     if agent_id == "claude":
         return _usage_claude_notice(usage_status, panel_limits)
     if agent_id == "grok" and _usage_grok_sign_in_lapsed():
         return "The grok CLI's sign-in expired. Run `grok login` to refresh it."
+    fetched = _usage_parse_updated_at(record.get("limitsFetchedAt"))
+    if panel_limits and fetched is not None and time.time() - fetched > 2 * USAGE_STALE_SECONDS:
+        renew = record.get("authHelpText") == CURSOR_RENEW_HELP
+        return f"Last checked {_usage_ago(fetched)}." + (f" {CURSOR_RENEW_HELP}" if renew else "")
     return ""
 
 
@@ -1970,7 +2005,7 @@ def _usage_panel_agent(agent_id: str, record: dict | None) -> dict:
         }
 
     limits = record.get("limits") if isinstance(record.get("limits"), list) else []
-    panel_limits = _usage_panel_limits(agent_id, limits)
+    panel_limits = _usage_panel_limits(agent_id, [limit for limit in limits if isinstance(limit, dict)])
     usage_status, auth_help = _usage_normalize_auth_help(agent_id, record)
     ready = record.get("ready") is True
     has_stats = record.get("hasLocalStats") is True or bool(record.get("modelUsage"))
@@ -1990,7 +2025,7 @@ def _usage_panel_agent(agent_id: str, record: dict | None) -> dict:
         "todayTotalTokens": _usage_number(record.get("todayTotalTokens")),
         "todayPrompts": _usage_number(record.get("todayPrompts")),
         "limits": panel_limits,
-        "notice": _usage_notice(agent_id, usage_status, panel_limits),
+        "notice": _usage_notice(agent_id, usage_status, panel_limits, record),
         # Offered only while a sign-in has lapsed and nobody has said yes yet.
         "renewOffered": (
             agent_id in RENEWABLE_SIGN_INS
@@ -2020,69 +2055,111 @@ def cmd_ai_usage(refresh: bool = False) -> int:
     return 0
 
 
+CURSOR_RENEW_HELP = "Cursor's sign-in expired. Open Cursor to renew it, then refresh."
+
+
+def _usage_carry_limits(previous: dict | None, record: dict) -> dict:
+    """No live numbers this run: keep the last ones with the time they were
+    fetched, so the panel marks them stale instead of passing them off as new.
+    Windows that have reset since are dropped; their numbers no longer apply."""
+    old = previous.get("limits") if isinstance(previous, dict) and isinstance(previous.get("limits"), list) else []
+    now = time.time()
+    kept = []
+    for limit in old:
+        if not isinstance(limit, dict):
+            continue
+        reset = _usage_parse_updated_at(limit.get("resetsAt"))
+        if reset is not None and reset <= now:
+            continue
+        kept.append(limit)
+    if not kept:
+        return record
+    fetched = previous.get("limitsFetchedAt") or previous.get("updatedAt") or record.get("updatedAt")
+    carried = dict(record)
+    carried.update({"limits": kept, "ready": True, "limitsFetchedAt": fetched, "updatedAt": fetched})
+    if not carried.get("tierLabel") and previous.get("tierLabel"):
+        carried["tierLabel"] = previous["tierLabel"]
+    return carried
+
+
+def _usage_collect_cursor() -> dict:
+    record = _usage_collect_cursor_local()
+    live = _usage_fetch_cursor_live()
+    live_limits = live.get("limits") if isinstance(live, dict) and isinstance(live.get("limits"), list) else []
+    if live_limits:
+        record.update(
+            {
+                "limits": live_limits,
+                "ready": True,
+                "authHelpText": live.get("authHelpText") or "",
+                "updatedAt": live.get("updatedAt") or record.get("updatedAt"),
+            }
+        )
+        if live.get("tierLabel"):
+            record["tierLabel"] = live["tierLabel"]
+    elif not _usage_cursor_bearer():
+        record["authHelpText"] = CURSOR_RENEW_HELP
+    return record
+
+
+def _usage_collect_grokbot() -> dict:
+    record = _usage_collect_grokbot_local()
+    if not record.get("limits") and not _usage_cursor_bearer():
+        record["authHelpText"] = CURSOR_RENEW_HELP
+    return record
+
+
+def _usage_update_provider(agent_id: str, collect) -> None:
+    # Built from this run only: merging the previous file kept old numbers
+    # under a fresh timestamp, and summed counters on every update.
+    previous = _usage_read_record(agent_id)
+    record = collect()
+    if isinstance(record.get("limits"), list) and record["limits"]:
+        record["limitsFetchedAt"] = record.get("updatedAt") or _usage_now_iso()
+    else:
+        record = _usage_carry_limits(previous, record)
+    _usage_write_record(agent_id, record)
+
+
+def _usage_deadline(_signum, _frame):
+    raise _UsageDeadline("update exceeded its time limit")
+
+
 def cmd_ai_usage_update() -> int:
     USAGE_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    signal.signal(signal.SIGALRM, _usage_deadline)
+    signal.alarm(USAGE_UPDATE_DEADLINE_SECONDS)
+    failed: list[str] = []
 
-    _usage_run_collector("grokbot")
-    collector_record = _usage_read_record("grokbot")
-    local_bot = _usage_collect_grokbot_local()
-    if isinstance(local_bot.get("limits"), list) and local_bot["limits"]:
-        _usage_write_record("grokbot", local_bot)
-    else:
-        merged = _usage_merge_records(collector_record, local_bot, agent_id="grokbot")
-        _usage_write_record("grokbot", merged)
-    if _usage_read_record("grokbot") is None:
-        record = _usage_base_record("grokbot")
-        record["usageStatusText"] = "Grok Bot usage unavailable"
-        record["authHelpText"] = USAGE_MISSING_HELP["grokbot"][1]
-        _usage_write_record("grokbot", record)
-
-    for agent_id, local_collector in (
-        ("cursor", _usage_collect_cursor_local),
+    # One provider's bad data must not stop the others, or Claude's renewal.
+    for agent_id, collect in (
+        ("grokbot", _usage_collect_grokbot),
+        ("cursor", _usage_collect_cursor),
         ("grok", _usage_collect_grok_local),
     ):
-        _usage_run_collector(agent_id)
-        collector_record = _usage_read_record(agent_id)
-        local_record = local_collector()
-        merged = _usage_merge_records(
-            collector_record,
-            local_record,
-            agent_id=agent_id,
-        )
+        try:
+            _usage_update_provider(agent_id, collect)
+        except _UsageDeadline:
+            raise
+        except Exception as exc:
+            failed.append(f"{agent_id}: {type(exc).__name__}")
 
-        if agent_id == "cursor":
-            live = _usage_fetch_cursor_live()
-            if live is not None:
-                live_limits = live.get("limits") if isinstance(live.get("limits"), list) else []
-                if live_limits:
-                    merged["limits"] = live_limits
-                    merged["ready"] = True
-                    if live.get("tierLabel"):
-                        merged["tierLabel"] = live["tierLabel"]
-                    merged["authHelpText"] = live.get("authHelpText") or ""
-                    merged["updatedAt"] = live.get("updatedAt") or merged.get("updatedAt")
-        elif agent_id == "grok":
-            live_limits = local_record.get("limits") if isinstance(local_record.get("limits"), list) else []
-            if live_limits:
-                merged["limits"] = live_limits
-                merged["ready"] = True
-                if local_record.get("tierLabel"):
-                    merged["tierLabel"] = local_record["tierLabel"]
-                merged["usageStatusText"] = local_record.get("usageStatusText") or ""
-                merged["authHelpText"] = local_record.get("authHelpText") or ""
-                merged["updatedAt"] = _usage_now_iso()
+    try:
+        _usage_claude_refresh_login()
+        claude_ok, claude_err = _usage_run_claude_collector("--limits-only")
+        if not claude_ok and _usage_read_record("claude") is None:
+            record = _usage_base_record("claude")
+            record["usageStatusText"] = "Claude usage unavailable"
+            record["authHelpText"] = claude_err or USAGE_MISSING_HELP["claude"][1]
+            _usage_write_record("claude", record)
+    except _UsageDeadline:
+        raise
+    except Exception as exc:
+        failed.append(f"claude: {type(exc).__name__}")
 
-        _usage_write_record(agent_id, merged)
-
-    _usage_claude_refresh_login()
-    claude_ok, claude_err = _usage_run_collector("claude", "--limits-only")
-    if not claude_ok and _usage_read_record("claude") is None:
-        record = _usage_base_record("claude")
-        record["usageStatusText"] = "Claude usage unavailable"
-        record["authHelpText"] = claude_err or USAGE_MISSING_HELP["claude"][1]
-        _usage_write_record("claude", record)
-
-    return 0
+    for line in failed:
+        print(f"update {line}", file=sys.stderr)
+    return 1 if failed else 0
 
 
 def cmd_consent(provider: str, value: str | None) -> int:

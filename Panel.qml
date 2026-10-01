@@ -19,6 +19,7 @@ Panel {
 
     property var snapshot: ({ agents: [] })
     property bool updating: false
+    property bool updatePending: false
     property bool showSettings: false
     property bool backgroundUpdateTried: false
     readonly property string appVersion: "0.6.1"
@@ -106,9 +107,13 @@ Panel {
         usageProc.running = true
     }
 
+    // Never kill a running update: it may be mid-way through saving a renewed
+    // sign-in, and losing that would sign Claude Code or grok out.
     function updateAndRefresh() {
-        if (updateProc.running)
-            updateProc.running = false
+        if (updateProc.running) {
+            root.updatePending = true
+            return
+        }
         root.updating = true
         updateProc.running = true
     }
@@ -121,11 +126,11 @@ Panel {
         return null
     }
 
+    // The backend stores every percent as a fraction of 1.
     function limitPercent(limit) {
         if (!limit) return null
         var p = Number(limit.percent)
         if (!isFinite(p)) return null
-        if (p > 1) p = p / 100
         return Math.max(0, Math.min(1, p))
     }
 
@@ -160,17 +165,31 @@ Panel {
     Process {
         id: updateProc
         onRunningChanged: {
-            if (!running) {
-                root.updating = false
-                root.refresh()
+            if (running) return
+            root.updating = false
+            if (root.updatePending) {
+                root.updatePending = false
+                root.updateAndRefresh()
+                return
             }
+            root.refresh()
         }
         command: [root.backend, "update"]
     }
 
+    // A hung update must not leave the panel on "Updating…" forever.
+    Timer {
+        interval: 120000
+        repeat: false
+        running: updateProc.running
+        onTriggered: updateProc.signal(15)
+    }
+
     Process {
         id: consentProc
-        onRunningChanged: if (!running) root.updateAndRefresh()
+        onRunningChanged: {
+            if (!running && root.opened) root.updateAndRefresh()
+        }
     }
 
     Timer {
@@ -181,7 +200,7 @@ Panel {
         triggeredOnStart: false
         onTriggered: {
             root.backgroundUpdateTried = false
-            root.refresh()
+            root.updateAndRefresh()
         }
     }
 
@@ -423,6 +442,7 @@ Panel {
 
             Label {
                 text: titleText
+                textFormat: Text.PlainText
                 font.bold: titleBold
                 font.pixelSize: titleSize
                 font.family: root.bar.fontFamily
@@ -431,6 +451,7 @@ Panel {
             Label {
                 visible: restText !== ""
                 text: restText
+                textFormat: Text.PlainText
                 font.pixelSize: titleSize
                 font.family: root.bar.fontFamily
                 color: root.bar.foreground
@@ -440,6 +461,7 @@ Panel {
         Label {
             visible: modelMeta !== ""
             text: modelMeta
+            textFormat: Text.PlainText
             color: root.mutedCaption
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.caption
@@ -494,6 +516,11 @@ Panel {
         readonly property var titleParts: splitMeterTitle
             ? splitMeterTitle(limit ? (limit.label || limit.title || "Usage") : "")
             : ({ bold: limit ? (limit.label || limit.title || "Usage") : "", rest: "" })
+
+        // Limit titles come from provider APIs; the title label is rich text.
+        function escapeHtml(value) {
+            return String(value).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+        }
         readonly property string rowCaption: {
             if (!limit) return ""
             if (limit.caption) return limit.caption
@@ -521,9 +548,7 @@ Panel {
                 Layout.alignment: Qt.AlignVCenter
                 wrapMode: Text.WordWrap
                 textFormat: Text.RichText
-                text: row.titleParts.rest !== ""
-                    ? "<b>" + row.titleParts.bold + "</b>" + row.titleParts.rest
-                    : "<b>" + row.titleParts.bold + "</b>"
+                text: "<b>" + row.escapeHtml(row.titleParts.bold) + "</b>" + row.escapeHtml(row.titleParts.rest)
                 color: bar.foreground
                 font.family: bar.fontFamily
                 font.pixelSize: Style.font.bodySmall
@@ -531,6 +556,7 @@ Panel {
 
             Label {
                 text: limit ? percentLabel(limit) : ""
+                textFormat: Text.PlainText
                 color: (limit && limitPercent && (limitPercent(limit) || 0) >= 0.9)
                     ? root.themeUrgent : bar.foreground
                 font.family: bar.fontFamily
@@ -553,6 +579,7 @@ Panel {
             wrapMode: Text.WordWrap
             visible: rowCaption !== ""
             text: rowCaption
+            textFormat: Text.PlainText
             color: row.mutedCaption
             font.family: bar.fontFamily
             font.pixelSize: Style.font.caption
@@ -614,6 +641,7 @@ Panel {
                 wrapMode: Text.WordWrap
                 visible: card.statusLine !== "" && (!card.showMeters || !(card.limits || []).length)
                 text: card.statusLine
+                textFormat: Text.PlainText
                 color: card.mutedCaption
                 font.family: card.bar.fontFamily
                 font.pixelSize: Style.font.caption
@@ -624,6 +652,7 @@ Panel {
                 wrapMode: Text.WordWrap
                 visible: card.notice !== "" && card.showMeters
                 text: card.notice
+                textFormat: Text.PlainText
                 color: root.themeUrgent
                 font.family: card.bar.fontFamily
                 font.pixelSize: Style.font.caption
