@@ -1,9 +1,9 @@
 #!/usr/bin/python3
 """AI Usage backend for the Omarchy bar panel.
 
-`read` prints the panel JSON from the usage state files; `update` refreshes
-those files from Cursor, Grok, and Claude; `consent` records whether this
-tool may renew the grok CLI or Claude Code sign-in when it lapses.
+`read` prints one SpaceXAI plan view built from Cursor, Grok Bot, and
+SuperGrok state files; `update` refreshes those files; `consent` records
+whether this tool may renew the grok CLI sign-in when it lapses.
 """
 
 from __future__ import annotations
@@ -28,23 +28,26 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-APP_VERSION = "0.6.2"
+APP_VERSION = "0.7.1"
 
 
 # ── AI agent usage (Cursor / Grok Bot / SuperGrok / Claude) ─────────────────
 
-AGENT_USAGE_IDS = ("cursor", "grokbot", "grok", "claude")
+# Providers that still write their own state files. The panel shows one
+# SpaceXAI plan view built from these, because Cursor / Grok Bot / SuperGrok
+# share the same allowance.
+AGENT_USAGE_IDS = ("cursor", "grokbot", "grok")
 AGENT_USAGE_NAMES = {
     "cursor": "Cursor",
     "grokbot": "Grok Bot",
     "grok": "SuperGrok",
-    "claude": "Claude",
+    "spacexai": "SpaceXAI",
 }
 STATE_HOME = Path(os.environ.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state"))
 # Shared with Omarchy's own agent-usage collectors, which write here too.
 USAGE_STATE_DIR = STATE_HOME / "omarchy" / "agents" / "usage"
 CONSENT_FILE = STATE_HOME / "omarchy" / "ai-usage" / "consent.json"
-RENEWABLE_SIGN_INS = ("claude", "grok")
+RENEWABLE_SIGN_INS = ("grok",)
 USAGE_STALE_SECONDS = 300
 CURSOR_DASHBOARD_USAGE_URL = (
     "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
@@ -82,10 +85,6 @@ USAGE_MISSING_HELP: dict[str, tuple[str, str]] = {
         "SuperGrok usage not loaded",
         "Run `grok login` on this machine, then refresh. "
         "Reads SuperGrok weekly Chat + Grok Build usage from grok login.",
-    ),
-    "claude": (
-        "Claude usage not loaded",
-        "Run `claude auth login` with your Claude subscription, then refresh.",
     ),
 }
 
@@ -1189,6 +1188,59 @@ def _usage_supergrok_weekly_fraction(config: dict) -> float | None:
     return None
 
 
+def _usage_plan_share_meta(product: str) -> tuple[str, str, str]:
+    """Map billing product ids onto dashboard labels and bar styles."""
+    key = str(product or "").lower().replace("_", "").replace(" ", "").replace("-", "")
+    if key in ("cursor", "productcursor"):
+        return "cursor", "Cursor", "accent"
+    if key in ("grokbot", "bot", "sand"):
+        return "grokbot", "Grok Bot", "grokbot"
+    if key in ("grokchat", "chat", "productapi", "api"):
+        return "chat", "Chat", "muted"
+    if "build" in key:
+        return "build", "Build", "grokbot"
+    label = str(product or "Other").strip() or "Other"
+    return key or "other", label, "muted"
+
+
+def _usage_plan_shares_from_config(config: dict) -> list[dict[str, Any]]:
+    """Absolute weekly-pool shares from unified SpaceXAI productUsage."""
+    products = _usage_field(config, "productUsage", "product_usage")
+    if not isinstance(products, list):
+        return []
+    shares: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in products:
+        if not isinstance(item, dict):
+            continue
+        percent = _usage_supergrok_percent_value(
+            _usage_field(item, "usagePercent", "usage_percent", "percent")
+        )
+        if percent is None:
+            continue
+        share_id, label, bar_style = _usage_plan_share_meta(
+            str(_usage_field(item, "product", "name", "label") or "")
+        )
+        if share_id in seen:
+            for existing in shares:
+                if existing["id"] == share_id:
+                    existing["percent"] = max(float(existing["percent"]), float(percent))
+                    break
+            continue
+        seen.add(share_id)
+        shares.append(
+            {
+                "id": share_id,
+                "label": label,
+                "percent": float(percent),
+                "barStyle": bar_style,
+            }
+        )
+    order = {"cursor": 0, "grokbot": 1, "chat": 2, "build": 3}
+    shares.sort(key=lambda row: (order.get(str(row["id"]), 50), str(row["label"])))
+    return shares
+
+
 def _usage_proto_varint(data: bytes, pos: int) -> tuple[int, int]:
     value = 0
     shift = 0
@@ -1317,6 +1369,8 @@ def _usage_grok_billing_snapshot() -> dict:
     billing = None
     product_total: float | None = None
     credit: float | None = None
+    plan_shares: list[dict[str, Any]] = []
+    unified_billing = False
     resets = ""
     for surface in ("interactive", "headless"):
         payload = _usage_grok_proxy_json("/billing?format=credits", surface=surface)
@@ -1327,6 +1381,11 @@ def _usage_grok_billing_snapshot() -> dict:
         cfg = payload.get("config") if isinstance(payload.get("config"), dict) else payload
         if not isinstance(cfg, dict):
             continue
+        shares = _usage_plan_shares_from_config(cfg)
+        if shares and (not plan_shares or len(shares) >= len(plan_shares)):
+            plan_shares = shares
+        if cfg.get("isUnifiedBillingUser") is True or cfg.get("is_unified_billing_user") is True:
+            unified_billing = True
         parts = _usage_supergrok_weekly_parts(cfg)
         if parts.get("combined") is not None:
             product_total = (
@@ -1349,7 +1408,11 @@ def _usage_grok_billing_snapshot() -> dict:
     web_percent, web_resets = _usage_grok_web_credits(token)
     resets = resets or web_resets
 
-    if product_total is not None:
+    if unified_billing and credit is not None:
+        percent = credit
+        if web_percent is not None:
+            percent = max(percent, web_percent)
+    elif product_total is not None:
         percent = product_total
         if web_percent is not None:
             percent = max(percent, web_percent)
@@ -1360,7 +1423,7 @@ def _usage_grok_billing_snapshot() -> dict:
     else:
         percent = credit
 
-    if percent is None and billing is None and web_percent is None:
+    if percent is None and billing is None and web_percent is None and not plan_shares:
         return snap
 
     tier = "SuperGrok"
@@ -1379,6 +1442,9 @@ def _usage_grok_billing_snapshot() -> dict:
     snap["percent"] = percent
     snap["resets_at"] = str(resets or "")
     snap["tier"] = tier or "SuperGrok"
+    snap["unified"] = unified_billing
+    if plan_shares:
+        snap["planShares"] = plan_shares
     return snap
 
 
@@ -1445,6 +1511,11 @@ def _usage_collect_grok_local() -> dict:
     snap = _usage_grok_billing_snapshot()
     if snap.get("tier"):
         record["tierLabel"] = str(snap.get("tier") or "SuperGrok")
+    if snap.get("unified") is True:
+        record["unifiedBilling"] = True
+    shares = snap.get("planShares")
+    if isinstance(shares, list) and shares:
+        record["planShares"] = shares
     percent = snap.get("percent")
     if percent is not None:
         limit = {
@@ -2014,7 +2085,7 @@ def _usage_panel_agent(agent_id: str, record: dict | None) -> dict:
     has_limits = bool(panel_limits)
     has_tier = bool(str(record.get("tierLabel") or "").strip())
     available = ready or has_stats or has_limits or has_tier or has_tokens or has_prompts
-    return {
+    payload = {
         "id": agent_id,
         "name": str(record.get("name") or AGENT_USAGE_NAMES.get(agent_id, agent_id)),
         "available": available,
@@ -2034,6 +2105,171 @@ def _usage_panel_agent(agent_id: str, record: dict | None) -> dict:
         ),
         "updatedAt": str(record.get("updatedAt") or _usage_now_iso()),
     }
+    shares = record.get("planShares")
+    if isinstance(shares, list) and shares:
+        payload["planShares"] = shares
+    if record.get("unifiedBilling") is True:
+        payload["unifiedBilling"] = True
+    return payload
+
+
+def _usage_limit_entry_percent(limit: dict | None) -> float | None:
+    if not isinstance(limit, dict):
+        return None
+    value = limit.get("percent")
+    if value is None:
+        return None
+    try:
+        percent = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not (percent == percent):  # NaN
+        return None
+    if percent > 1:
+        percent /= 100.0
+    return min(1.0, max(0.0, percent))
+
+
+def _usage_spacexai_panel_agent(providers: dict[str, dict]) -> dict:
+    """One SpaceXAI plan meter plus Cursor / Grok Bot / Chat pool shares."""
+    cursor = providers.get("cursor") or {}
+    grokbot = providers.get("grokbot") or {}
+    grok = providers.get("grok") or {}
+
+    cursor_limits = [limit for limit in (cursor.get("limits") or []) if isinstance(limit, dict)]
+    cursor_main = cursor_limits[0] if cursor_limits else None
+    bot = next((limit for limit in (grokbot.get("limits") or []) if isinstance(limit, dict)), None)
+    build = next((limit for limit in (grok.get("limits") or []) if isinstance(limit, dict)), None)
+
+    shared = []
+    for limit in (cursor_main, bot, build):
+        percent = _usage_limit_entry_percent(limit)
+        if percent is not None:
+            shared.append((percent, limit))
+    unified = max((item[0] for item in shared), default=None)
+    reset_source = next((item[1] for item in shared), {}) or {}
+
+    breakdown: list[dict[str, Any]] = []
+    plan_shares = grok.get("planShares") if isinstance(grok.get("planShares"), list) else []
+    if plan_shares:
+        for share in plan_shares:
+            if not isinstance(share, dict):
+                continue
+            percent = _usage_limit_entry_percent(share)
+            if percent is None:
+                continue
+            breakdown.append(
+                {
+                    "id": str(share.get("id") or share.get("label") or "share"),
+                    "label": str(share.get("label") or share.get("id") or "Usage"),
+                    "detail": "",
+                    "percent": percent,
+                    "barStyle": str(share.get("barStyle") or "accent"),
+                }
+            )
+        share_total = sum(float(row["percent"]) for row in breakdown)
+        if share_total > 0:
+            unified = max(unified or 0.0, min(1.0, share_total))
+    else:
+        if cursor_main is not None and _usage_limit_entry_percent(cursor_main) is not None:
+            breakdown.append(
+                {
+                    "id": "cursor",
+                    "label": "Cursor",
+                    "detail": "",
+                    "percent": _usage_limit_entry_percent(cursor_main),
+                    "barStyle": "accent",
+                }
+            )
+        if bot is not None and _usage_limit_entry_percent(bot) is not None:
+            breakdown.append(
+                {
+                    "id": "grokbot",
+                    "label": "Grok Bot",
+                    "detail": "",
+                    "percent": _usage_limit_entry_percent(bot),
+                    "barStyle": "grokbot",
+                }
+            )
+        if build is not None and _usage_limit_entry_percent(build) is not None:
+            breakdown.append(
+                {
+                    "id": "chat",
+                    "label": "Chat",
+                    "detail": "",
+                    "percent": _usage_limit_entry_percent(build),
+                    "barStyle": "muted",
+                }
+            )
+
+    available = any(bool(agent.get("available")) for agent in (cursor, grokbot, grok))
+    ready = any(bool(agent.get("ready")) for agent in (cursor, grokbot, grok))
+    status_parts = [
+        str(agent.get("usageStatusText") or "").strip()
+        for agent in (cursor, grokbot, grok)
+        if str(agent.get("usageStatusText") or "").strip()
+    ]
+    help_parts = [
+        str(agent.get("authHelpText") or "").strip()
+        for agent in (cursor, grokbot, grok)
+        if str(agent.get("authHelpText") or "").strip()
+    ]
+    # Prefer Cursor's live-dashboard note; fall back to the first useful line.
+    auth_help = ""
+    for text_help in help_parts:
+        if "Live Cursor" in text_help or "dashboard" in text_help.lower():
+            auth_help = text_help
+            break
+    if not auth_help and help_parts:
+        auth_help = help_parts[0]
+    usage_status = status_parts[0] if status_parts else ""
+    if available and breakdown:
+        usage_status = ""
+        auth_help = auth_help if "expired" in auth_help.lower() or "sign" in auth_help.lower() else ""
+
+    tier = str(cursor.get("tierLabel") or "").strip()
+    if not tier:
+        tier = str(grok.get("tierLabel") or "").strip()
+    if not tier:
+        tier = "SpaceXAI Plan"
+
+    updated_candidates = [
+        str(agent.get("updatedAt") or "")
+        for agent in (cursor, grokbot, grok)
+        if agent.get("updatedAt")
+    ]
+    updated_at = max(updated_candidates) if updated_candidates else _usage_now_iso()
+
+    limits = []
+    if unified is not None:
+        limits.append(
+            _usage_panel_limit(
+                "Usage",
+                unified,
+                bar_style="accent",
+                caption=(
+                    "Shared SpaceXAI weekly allowance. Breakdown is each product's share of that pool."
+                ),
+                resets_at=reset_source.get("resetsAt"),
+            )
+        )
+
+    return {
+        "id": "spacexai",
+        "name": "SpaceXAI",
+        "available": available,
+        "ready": ready,
+        "tierLabel": tier,
+        "usageStatusText": usage_status,
+        "authHelpText": auth_help,
+        "todayTotalTokens": 0,
+        "todayPrompts": 0,
+        "limits": limits,
+        "breakdown": breakdown,
+        "notice": str(grok.get("notice") or ""),
+        "renewOffered": bool(grok.get("renewOffered")),
+        "updatedAt": updated_at,
+    }
 
 
 def cmd_ai_usage(refresh: bool = False) -> int:
@@ -2043,7 +2279,11 @@ def cmd_ai_usage(refresh: bool = False) -> int:
         cmd_ai_usage_update()
         missing = any(_usage_read_record(agent_id) is None for agent_id in AGENT_USAGE_IDS)
         stale = any(_usage_record_is_stale(_usage_read_record(agent_id)) for agent_id in AGENT_USAGE_IDS)
-    agents = [_usage_panel_agent(agent_id, _usage_read_record(agent_id)) for agent_id in AGENT_USAGE_IDS]
+    providers = {
+        agent_id: _usage_panel_agent(agent_id, _usage_read_record(agent_id))
+        for agent_id in AGENT_USAGE_IDS
+    }
+    agents = [_usage_spacexai_panel_agent(providers)]
     print(json.dumps(
         {
             "agents": agents,
@@ -2131,7 +2371,7 @@ def cmd_ai_usage_update() -> int:
     signal.alarm(USAGE_UPDATE_DEADLINE_SECONDS)
     failed: list[str] = []
 
-    # One provider's bad data must not stop the others, or Claude's renewal.
+    # One provider's bad data must not stop the others.
     for agent_id, collect in (
         ("grokbot", _usage_collect_grokbot),
         ("cursor", _usage_collect_cursor),
@@ -2143,19 +2383,6 @@ def cmd_ai_usage_update() -> int:
             raise
         except Exception as exc:
             failed.append(f"{agent_id}: {type(exc).__name__}")
-
-    try:
-        _usage_claude_refresh_login()
-        claude_ok, claude_err = _usage_run_claude_collector("--limits-only")
-        if not claude_ok and _usage_read_record("claude") is None:
-            record = _usage_base_record("claude")
-            record["usageStatusText"] = "Claude usage unavailable"
-            record["authHelpText"] = claude_err or USAGE_MISSING_HELP["claude"][1]
-            _usage_write_record("claude", record)
-    except _UsageDeadline:
-        raise
-    except Exception as exc:
-        failed.append(f"claude: {type(exc).__name__}")
 
     for line in failed:
         print(f"update {line}", file=sys.stderr)
@@ -2181,7 +2408,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--version", action="version", version=APP_VERSION)
     sub = parser.add_subparsers(dest="command")
 
-    read = sub.add_parser("read", help="Print the panel JSON for Cursor, Grok Bot, SuperGrok, and Claude")
+    read = sub.add_parser("read", help="Print the panel JSON for the shared SpaceXAI plan")
     read.add_argument("--refresh", action="store_true", help="Run update before reading the state files")
     sub.add_parser("update", help="Refresh the usage state files")
     consent = sub.add_parser(

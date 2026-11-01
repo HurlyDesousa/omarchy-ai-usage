@@ -1,4 +1,4 @@
-// AI Usage panel — Cursor / Grok Bot / SuperGrok / Claude quota bars.
+// AI Usage panel — unified SpaceXAI plan with Cursor / Grok Bot / Chat breakdown.
 import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
@@ -22,7 +22,7 @@ Panel {
     property bool updatePending: false
     property bool showSettings: false
     property bool backgroundUpdateTried: false
-    readonly property string appVersion: "0.6.1"
+    readonly property string appVersion: "0.7.0"
 
     readonly property string pluginDir: {
         var s = String(Qt.resolvedUrl("."))
@@ -38,20 +38,20 @@ Panel {
     readonly property int refreshMs: 300000
 
     // Live Omarchy theme tokens — Color/Style update on `omarchy theme set`.
-    readonly property color themeForeground: bar ? bar.foreground : Color.foreground
-    readonly property color themeUrgent: (bar && bar.urgent) ? bar.urgent : Color.urgent
+    readonly property color themeForeground: bar ? bar.foreground : OmColor.foreground
+    readonly property color themeUrgent: (bar && bar.urgent) ? bar.urgent : OmColor.urgent
     readonly property color cardSurface: {
         var _live = Style.normalFill
-        return Style.normalFillFor(themeForeground, Color.accent, Color.urgent)
+        return Style.normalFillFor(themeForeground, OmColor.accent, OmColor.urgent)
     }
     readonly property color barTrack: {
         var _live = Style.selectedFill
-        return Style.selectedFillFor(themeForeground, Color.accent, Color.urgent)
+        return Style.selectedFillFor(themeForeground, OmColor.accent, OmColor.urgent)
     }
-    readonly property color cursorBarFill: Color.accent
+    readonly property color cursorBarFill: OmColor.accent
     readonly property color otherBarFill: themeForeground
-    readonly property color grokBotBarFill: Color.accent
-    readonly property color mutedCaption: Color.muted
+    readonly property color grokBotBarFill: OmColor.accent
+    readonly property color mutedCaption: OmColor.muted
 
     // Per-widget options live on this widget's entry in shell.json.
     function setting(name, fallback) {
@@ -108,7 +108,7 @@ Panel {
     }
 
     // Never kill a running update: it may be mid-way through saving a renewed
-    // sign-in, and losing that would sign Claude Code or grok out.
+    // grok sign-in.
     function updateAndRefresh() {
         if (updateProc.running) {
             root.updatePending = true
@@ -265,7 +265,7 @@ Panel {
                         Rectangle {
                             width: 26; height: 26; radius: Style.cornerRadius
                             opacity: root.updating ? 0.5 : 1.0
-                            color: Style.hoverFillFor(root.bar.foreground, Color.accent)
+                            color: Style.hoverFillFor(root.bar.foreground, OmColor.accent)
                             Label {
                                 anchors.centerIn: parent
                                 text: "󰑐"
@@ -284,14 +284,14 @@ Panel {
                         Rectangle {
                             width: 26; height: 26; radius: Style.cornerRadius
                             color: root.showSettings
-                                ? Style.hoverFillFor(root.bar.foreground, Color.accent) : "transparent"
+                                ? Style.hoverFillFor(root.bar.foreground, OmColor.accent) : "transparent"
                             Label {
                                 anchors.centerIn: parent
                                 text: "󰒓"
                                 font.family: root.bar.fontFamily
                                 font.pixelSize: Style.font.body
                                 color: root.showSettings
-                                    ? Style.hoverStateColor(root.bar.foreground, Color.accent)
+                                    ? Style.hoverStateColor(root.bar.foreground, OmColor.accent)
                                     : Qt.darker(root.bar.foreground, 1.4)
                             }
                             MouseArea {
@@ -337,69 +337,15 @@ Panel {
                         x: Style.space(16)
                         spacing: Style.space(14)
 
-                        CursorUsageSection {
+                        SpaceXaiUsageSection {
                             width: parent.width
-                            visible: root.setting("showCursor", true) !== false
-                            agent: root.agentById("cursor")
+                            visible: root.setting("showSpaceXai", true) !== false
+                            agent: root.agentById("spacexai")
                             bar: root.bar
                             emDash: root.emDash
                             percentLabel: root.percentLabel
                             limitPercent: root.limitPercent
-                            statusLine: root.statusLine(root.agentById("cursor"))
-                            splitMeterTitle: root.splitMeterTitle
-                            cardSurface: root.cardSurface
-                            barTrack: root.barTrack
-                            cursorBarFill: root.cursorBarFill
-                            otherBarFill: root.otherBarFill
-                            grokBotBarFill: root.grokBotBarFill
-                            mutedCaption: root.mutedCaption
-                        }
-
-                        GrokBotUsageSection {
-                            width: parent.width
-                            visible: root.setting("showGrokBot", true) !== false
-                            agent: root.agentById("grokbot")
-                            bar: root.bar
-                            emDash: root.emDash
-                            percentLabel: root.percentLabel
-                            limitPercent: root.limitPercent
-                            statusLine: root.statusLine(root.agentById("grokbot"))
-                            splitMeterTitle: root.splitMeterTitle
-                            cardSurface: root.cardSurface
-                            barTrack: root.barTrack
-                            cursorBarFill: root.cursorBarFill
-                            otherBarFill: root.otherBarFill
-                            grokBotBarFill: root.grokBotBarFill
-                            mutedCaption: root.mutedCaption
-                        }
-
-                        GrokBuildUsageSection {
-                            width: parent.width
-                            visible: root.setting("showSuperGrok", true) !== false
-                            agent: root.agentById("grok")
-                            bar: root.bar
-                            emDash: root.emDash
-                            percentLabel: root.percentLabel
-                            limitPercent: root.limitPercent
-                            statusLine: root.statusLine(root.agentById("grok"))
-                            splitMeterTitle: root.splitMeterTitle
-                            cardSurface: root.cardSurface
-                            barTrack: root.barTrack
-                            cursorBarFill: root.cursorBarFill
-                            otherBarFill: root.otherBarFill
-                            grokBotBarFill: root.grokBotBarFill
-                            mutedCaption: root.mutedCaption
-                        }
-
-                        ClaudeUsageSection {
-                            width: parent.width
-                            visible: root.setting("showClaude", true) !== false
-                            agent: root.agentById("claude")
-                            bar: root.bar
-                            emDash: root.emDash
-                            percentLabel: root.percentLabel
-                            limitPercent: root.limitPercent
-                            statusLine: root.statusLine(root.agentById("claude"))
+                            statusLine: root.statusLine(root.agentById("spacexai"))
                             splitMeterTitle: root.splitMeterTitle
                             cardSurface: root.cardSurface
                             barTrack: root.barTrack
@@ -477,7 +423,7 @@ Panel {
         property real fraction: 0
         property string barStyle: "cursor"
         property color trackColor: Style.selectedFill
-        property color fillColor: Color.accent
+        property color fillColor: OmColor.accent
         readonly property bool alarming: fraction >= 0.9
         height: Math.max(Style.space(4), Math.round(Style.spacing.controlHeight * 0.14))
 
@@ -606,7 +552,7 @@ Panel {
 
         radius: Style.cornerRadius
         color: card.cardSurface
-        borderSpec: Border.controlSpec("normal", bar ? bar.foreground : Color.foreground, Color.accent)
+        borderSpec: Border.controlSpec("normal", bar ? bar.foreground : OmColor.foreground, OmColor.accent)
         implicitWidth: parent ? parent.width : 0
         implicitHeight: cardColumn.implicitHeight + Style.space(28)
 
@@ -660,108 +606,80 @@ Panel {
         }
     }
 
-    component CursorUsageSection: Column {
-        property var agent
+    component BreakdownMeterRow: Column {
+        id: breakdownRow
+        property var entry
         property var bar
-        property string emDash
         property var percentLabel
         property var limitPercent
-        property string statusLine: ""
-        property string sectionTitle: "Cursor"
-        property var splitMeterTitle
-        property color cardSurface
         property color barTrack
         property color cursorBarFill
         property color otherBarFill
         property color grokBotBarFill
         property color mutedCaption
 
-        spacing: Style.space(8)
+        spacing: Style.space(4)
         width: parent.width
 
-        SectionNameRow {
+        readonly property var asLimit: ({
+            label: entry ? (entry.label || "") : "",
+            title: entry ? (entry.label || "") : "",
+            percent: entry ? entry.percent : null,
+            barStyle: entry && entry.barStyle ? entry.barStyle : "accent",
+            caption: entry && entry.detail ? entry.detail : ""
+        })
+
+        RowLayout {
             width: parent.width
-            titleText: parent.sectionTitle
-            modelMeta: root.sectionLabel("cursorLabel", agent, "")
-        }
+            spacing: Style.space(8)
 
-        UsageCard {
-            width: parent.width
-            bar: parent.bar
-            limits: agent ? (agent.limits || []) : []
-            percentLabel: parent.percentLabel
-            limitPercent: parent.limitPercent
-            splitMeterTitle: parent.splitMeterTitle
-            cardSurface: parent.cardSurface
-            barTrack: parent.barTrack
-            cursorBarFill: parent.cursorBarFill
-            otherBarFill: parent.otherBarFill
-            grokBotBarFill: parent.grokBotBarFill
-            mutedCaption: parent.mutedCaption
-            statusLine: parent.statusLine
-            showMeters: agent && (agent.limits || []).length > 0
-        }
-    }
+            Label {
+                Layout.fillWidth: true
+                text: breakdownRow.asLimit.label
+                textFormat: Text.PlainText
+                color: bar.foreground
+                font.family: bar.fontFamily
+                font.pixelSize: Style.font.caption
+            }
 
-    component GrokBotUsageSection: Column {
-        property var agent
-        property var bar
-        property string emDash
-        property var percentLabel
-        property var limitPercent
-        property string statusLine: ""
-        property var splitMeterTitle
-        property color cardSurface
-        property color barTrack
-        property color cursorBarFill
-        property color otherBarFill
-        property color grokBotBarFill
-        property color mutedCaption
-
-        spacing: Style.space(8)
-        width: parent.width
-
-        SectionNameRow {
-            width: parent.width
-            titleText: "Grok Bot"
-            modelMeta: root.sectionLabel("grokBotLabel", agent, "")
-        }
-
-        UsageCard {
-            width: parent.width
-            bar: parent.bar
-            limits: grokBotLimits(agent)
-            percentLabel: parent.percentLabel
-            limitPercent: parent.limitPercent
-            splitMeterTitle: parent.splitMeterTitle
-            cardSurface: parent.cardSurface
-            barTrack: parent.barTrack
-            cursorBarFill: parent.cursorBarFill
-            otherBarFill: parent.otherBarFill
-            grokBotBarFill: parent.grokBotBarFill
-            mutedCaption: parent.mutedCaption
-            statusLine: parent.statusLine
-            showMeters: agent && grokBotLimits(agent).length > 0
-
-            function grokBotLimits(agentRef) {
-                var limits = agentRef ? (agentRef.limits || []) : []
-                var styled = []
-                for (var i = 0; i < limits.length; i++) {
-                    var entry = limits[i]
-                    var copy = {}
-                    for (var key in entry)
-                        copy[key] = entry[key]
-                    copy.barStyle = "grokbot"
-                    copy.label = "Usage"
-                    copy.title = "Usage"
-                    styled.push(copy)
-                }
-                return styled
+            Label {
+                text: percentLabel(breakdownRow.asLimit)
+                textFormat: Text.PlainText
+                color: (limitPercent(breakdownRow.asLimit) || 0) >= 0.9
+                    ? root.themeUrgent : mutedCaption
+                font.family: bar.fontFamily
+                font.pixelSize: Style.font.caption
+                horizontalAlignment: Text.AlignRight
             }
         }
+
+        MeterBar {
+            width: parent.width
+            height: Math.max(Style.space(3), Math.round(Style.spacing.controlHeight * 0.10))
+            fraction: limitPercent(breakdownRow.asLimit) || 0
+            barStyle: breakdownRow.asLimit.barStyle
+            trackColor: barTrack
+            fillColor: {
+                if (breakdownRow.asLimit.barStyle === "muted") return otherBarFill
+                if (breakdownRow.asLimit.barStyle === "grokbot") return grokBotBarFill
+                return cursorBarFill
+            }
+        }
+
+        Label {
+            width: parent.width
+            wrapMode: Text.WordWrap
+            visible: breakdownRow.asLimit.caption !== ""
+            text: breakdownRow.asLimit.caption
+            textFormat: Text.PlainText
+            color: mutedCaption
+            font.family: bar.fontFamily
+            font.pixelSize: Style.font.caption
+        }
     }
 
-    component GrokBuildUsageSection: Column {
+    component SpaceXaiUsageSection: Column {
+        id: spaceSection
         property var agent
         property var bar
         property string emDash
@@ -781,95 +699,80 @@ Panel {
 
         SectionNameRow {
             width: parent.width
-            titleText: "SuperGrok"
-            modelMeta: root.sectionLabel("superGrokLabel", agent, "SuperGrok")
+            titleText: "SpaceXAI"
+            modelMeta: root.sectionLabel("spaceXaiLabel", spaceSection.agent, "SpaceXAI Plan")
         }
 
         UsageCard {
             width: parent.width
-            bar: parent.bar
-            limits: grokBuildLimits(agent)
-            notice: agent && agent.notice ? agent.notice : ""
-            percentLabel: parent.percentLabel
-            limitPercent: parent.limitPercent
-            splitMeterTitle: parent.splitMeterTitle
-            cardSurface: parent.cardSurface
-            barTrack: parent.barTrack
-            cursorBarFill: parent.cursorBarFill
-            otherBarFill: parent.otherBarFill
-            grokBotBarFill: parent.grokBotBarFill
-            mutedCaption: parent.mutedCaption
-            statusLine: parent.statusLine
-            showMeters: agent && grokBuildLimits(agent).length > 0
+            bar: spaceSection.bar
+            limits: spaceSection.agent ? (spaceSection.agent.limits || []) : []
+            notice: spaceSection.agent && spaceSection.agent.notice ? spaceSection.agent.notice : ""
+            percentLabel: spaceSection.percentLabel
+            limitPercent: spaceSection.limitPercent
+            splitMeterTitle: spaceSection.splitMeterTitle
+            cardSurface: spaceSection.cardSurface
+            barTrack: spaceSection.barTrack
+            cursorBarFill: spaceSection.cursorBarFill
+            otherBarFill: spaceSection.otherBarFill
+            grokBotBarFill: spaceSection.grokBotBarFill
+            mutedCaption: spaceSection.mutedCaption
+            statusLine: spaceSection.statusLine
+            showMeters: spaceSection.agent && (spaceSection.agent.limits || []).length > 0
+        }
 
-            function grokBuildLimits(agentRef) {
-                var limits = agentRef ? (agentRef.limits || []) : []
-                var styled = []
-                for (var i = 0; i < limits.length; i++) {
-                    var entry = limits[i]
-                    var copy = {}
-                    for (var key in entry)
-                        copy[key] = entry[key]
-                    copy.barStyle = "grokbot"
-                    styled.push(copy)
+        Column {
+            width: parent.width
+            spacing: Style.space(8)
+            visible: spaceSection.agent && (spaceSection.agent.breakdown || []).length > 0
+
+            Label {
+                text: "Usage breakdown"
+                color: spaceSection.mutedCaption
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+                font.letterSpacing: 0.6
+            }
+
+            BorderSurface {
+                width: parent.width
+                radius: Style.cornerRadius
+                color: spaceSection.cardSurface
+                borderSpec: Border.controlSpec("normal", root.bar.foreground, OmColor.accent)
+                implicitHeight: breakdownColumn.implicitHeight + Style.space(24)
+
+                Column {
+                    id: breakdownColumn
+                    anchors.left: parent.left
+                    anchors.right: parent.right
+                    anchors.top: parent.top
+                    anchors.margins: Style.space(12)
+                    spacing: Style.space(10)
+
+                    Repeater {
+                        model: spaceSection.agent ? (spaceSection.agent.breakdown || []) : []
+                        delegate: BreakdownMeterRow {
+                            required property var modelData
+                            width: parent.width
+                            entry: modelData
+                            bar: spaceSection.bar
+                            percentLabel: spaceSection.percentLabel
+                            limitPercent: spaceSection.limitPercent
+                            barTrack: spaceSection.barTrack
+                            cursorBarFill: spaceSection.cursorBarFill
+                            otherBarFill: spaceSection.otherBarFill
+                            grokBotBarFill: spaceSection.grokBotBarFill
+                            mutedCaption: spaceSection.mutedCaption
+                        }
+                    }
                 }
-                return styled
             }
         }
 
         RenewSignInButton {
-            agent: parent.agent
+            agent: spaceSection.agent
             provider: "grok"
-            bar: parent.bar
-        }
-    }
-
-    component ClaudeUsageSection: Column {
-        property var agent
-        property var bar
-        property string emDash
-        property var percentLabel
-        property var limitPercent
-        property string statusLine: ""
-        property var splitMeterTitle
-        property color cardSurface
-        property color barTrack
-        property color cursorBarFill
-        property color otherBarFill
-        property color grokBotBarFill
-        property color mutedCaption
-
-        spacing: Style.space(8)
-        width: parent.width
-
-        SectionNameRow {
-            width: parent.width
-            titleText: "Claude"
-            modelMeta: root.sectionLabel("claudeLabel", agent, "")
-        }
-
-        UsageCard {
-            width: parent.width
-            bar: parent.bar
-            limits: agent ? (agent.limits || []) : []
-            notice: agent && agent.notice ? agent.notice : ""
-            percentLabel: parent.percentLabel
-            limitPercent: parent.limitPercent
-            splitMeterTitle: parent.splitMeterTitle
-            cardSurface: parent.cardSurface
-            barTrack: parent.barTrack
-            cursorBarFill: parent.cursorBarFill
-            otherBarFill: parent.otherBarFill
-            grokBotBarFill: parent.grokBotBarFill
-            mutedCaption: parent.mutedCaption
-            statusLine: parent.statusLine
-            showMeters: agent && (agent.limits || []).length > 0
-        }
-
-        RenewSignInButton {
-            agent: parent.agent
-            provider: "claude"
-            bar: parent.bar
+            bar: spaceSection.bar
         }
     }
 
