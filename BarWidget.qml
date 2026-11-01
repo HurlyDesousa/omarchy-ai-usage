@@ -109,7 +109,7 @@ BarWidget {
         id: button
         bar: root.bar
         text: "󰚩"
-        tooltipText: "AI usage (Cursor, Grok Bot, SuperGrok, Claude)"
+        tooltipText: "AI usage (SpaceXAI plan)"
         onPressed: function(b) {
             if (b !== Qt.RightButton) {
                 if (root.opened && panelLoader.item) panelLoader.item.showSettings = false
